@@ -56,7 +56,8 @@ class BlenderMCPServer:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
+            # Allow small backlog to avoid flaky reconnects during rapid tool calls.
+            self.socket.listen(5)
 
             # Start server thread
             self.server_thread = threading.Thread(target=self._server_loop)
@@ -73,6 +74,10 @@ class BlenderMCPServer:
 
         # Close socket
         if self.socket:
+            try:
+                self.socket.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
             try:
                 self.socket.close()
             except:
@@ -93,9 +98,12 @@ class BlenderMCPServer:
     def _server_loop(self):
         """Main server loop in a separate thread"""
         print("Server thread started")
+        if not self.socket:
+            print("Server socket is not available")
+            return
         self.socket.settimeout(1.0)  # Timeout to allow for stopping
 
-        while self.running:
+        while self.running and self.socket:
             try:
                 # Accept new connection
                 try:
@@ -112,6 +120,12 @@ class BlenderMCPServer:
                 except socket.timeout:
                     # Just check running condition
                     continue
+                except OSError as e:
+                    # Socket closed while stopping/restarting.
+                    if not self.running:
+                        break
+                    print(f"Socket error accepting connection: {str(e)}")
+                    time.sleep(0.2)
                 except Exception as e:
                     print(f"Error accepting connection: {str(e)}")
                     time.sleep(0.5)
