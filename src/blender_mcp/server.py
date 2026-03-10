@@ -31,21 +31,40 @@ class BlenderConnection:
     host: str
     port: int
     sock: socket.socket = None  # Changed from 'socket' to 'sock' to avoid naming conflict
+
+    def _candidate_ports(self) -> List[int]:
+        ports = [self.port]
+        if self.port == DEFAULT_PORT:
+            ports.append(DEFAULT_PORT + 1)
+        return ports
     
     def connect(self) -> bool:
         """Connect to the Blender addon socket server"""
         if self.sock:
             return True
             
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((self.host, self.port))
-            logger.info(f"Connected to Blender at {self.host}:{self.port}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to Blender: {str(e)}")
-            self.sock = None
-            return False
+        last_error = None
+        for port in self._candidate_ports():
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((self.host, port))
+                self.sock = sock
+                self.port = port
+                logger.info(f"Connected to Blender at {self.host}:{self.port}")
+                return True
+            except Exception as e:
+                last_error = e
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                logger.warning(f"Failed to connect to Blender at {self.host}:{port}: {str(e)}")
+        self.sock = None
+        if last_error:
+            logger.error(f"Failed to connect to Blender on candidate ports {self._candidate_ports()}: {str(last_error)}")
+        return False
     
     def disconnect(self):
         """Disconnect from the Blender addon"""

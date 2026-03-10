@@ -44,6 +44,34 @@ class BlenderMCPServer:
         self.socket = None
         self.server_thread = None
 
+    def _candidate_ports(self):
+        ports = [self.port]
+        if self.port == 9876:
+            ports.append(9877)
+        return ports
+
+    def _bind_socket(self):
+        last_error = None
+        for port in self._candidate_ports():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.host, port))
+                sock.listen(5)
+                self.socket = sock
+                self.port = port
+                return
+            except OSError as exc:
+                last_error = exc
+                try:
+                    sock.close()
+                except:
+                    pass
+                if port != self._candidate_ports()[-1]:
+                    print(f"Port {port} unavailable, trying next port")
+        if last_error:
+            raise last_error
+
     def start(self):
         if self.running:
             print("Server is already running")
@@ -52,12 +80,7 @@ class BlenderMCPServer:
         self.running = True
 
         try:
-            # Create socket
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind((self.host, self.port))
-            # Allow small backlog to avoid flaky reconnects during rapid tool calls.
-            self.socket.listen(5)
+            self._bind_socket()
 
             # Start server thread
             self.server_thread = threading.Thread(target=self._server_loop)
@@ -2439,9 +2462,16 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
 
         # Start the server
         bpy.types.blendermcp_server.start()
-        scene.blendermcp_server_running = True
+        server = bpy.types.blendermcp_server
+        if server.running and server.socket:
+            scene.blendermcp_port = server.port
+            scene.blendermcp_server_running = True
+            self.report({'INFO'}, f"BlenderMCP listening on port {server.port}")
+            return {'FINISHED'}
 
-        return {'FINISHED'}
+        scene.blendermcp_server_running = False
+        self.report({'ERROR'}, "Failed to start BlenderMCP server")
+        return {'CANCELLED'}
 
 # Operator to stop the server
 class BLENDERMCP_OT_StopServer(bpy.types.Operator):
