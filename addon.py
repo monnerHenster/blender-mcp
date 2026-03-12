@@ -13,12 +13,15 @@ import traceback
 import os
 import shutil
 import zipfile
-from bpy.props import IntProperty, BoolProperty
+from bpy.props import IntProperty, BoolProperty, FloatProperty
 import io
 from datetime import datetime
 import hashlib, hmac, base64
 import os.path as osp
 from contextlib import redirect_stdout, suppress
+from bpy.app.handlers import persistent
+import types
+import ast
 
 bl_info = {
     "name": "Blender MCP",
@@ -52,7 +55,8 @@ class BlenderMCPServer:
 
     def _bind_socket(self):
         last_error = None
-        for port in self._candidate_ports():
+        ports = self._candidate_ports()
+        for i, port in enumerate(ports):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -67,7 +71,7 @@ class BlenderMCPServer:
                     sock.close()
                 except:
                     pass
-                if port != self._candidate_ports()[-1]:
+                if i < len(ports) - 1:
                     print(f"Port {port} unavailable, trying next port")
         if last_error:
             raise last_error
@@ -144,7 +148,6 @@ class BlenderMCPServer:
                     # Just check running condition
                     continue
                 except OSError as e:
-                    # Socket closed while stopping/restarting.
                     if not self.running:
                         break
                     print(f"Socket error accepting connection: {str(e)}")
@@ -190,7 +193,7 @@ class BlenderMCPServer:
                                     client.sendall(response_json.encode('utf-8'))
                                 except:
                                     print("Failed to send response - client disconnected")
-                            except Exception as e:
+                            except BaseException as e:
                                 print(f"Error executing command: {str(e)}")
                                 traceback.print_exc()
                                 try:
@@ -225,7 +228,7 @@ class BlenderMCPServer:
         try:
             return self._execute_command_internal(command)
 
-        except Exception as e:
+        except BaseException as e:
             print(f"Error executing command: {str(e)}")
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
@@ -459,17 +462,229 @@ class BlenderMCPServer:
         """Execute arbitrary Blender Python code"""
         # This is powerful but potentially dangerous - use with caution
         try:
-            # Create a local namespace for execution
-            namespace = {"bpy": bpy}
+            # Guardrail: Outliner UI operators are crash-prone in headless/remote automation.
+            if "bpy.ops.outliner." in code:
+                raise Exception(
+                    "Blocked unsafe operator usage: bpy.ops.outliner.*. "
+                    "Use bpy.data.objects[...] style data API instead."
+                )
+
+            class _RenderBudgetExceeded(Exception):
+                pass
+
+            def _parse_budget_directive(name, default_value):
+                pattern = rf"(?mi)^\\s*(?:#\\s*)?{name}\\s*=\\s*([0-9]+(?:\\.[0-9]+)?)\\s*$"
+                m = re.search(pattern, code)
+                if not m:
+                    return default_value
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    return default_value
+
+            def _parse_bool_directive(name, default_value):
+                pattern = rf"(?mi)^\\s*(?:#\\s*)?{name}\\s*=\\s*(true|false|1|0|yes|no|on|off)\\s*$"
+                m = re.search(pattern, code)
+                if not m:
+                    return default_value
+                token = m.group(1).strip().lower()
+                return token in {"true", "1", "yes", "on"}
+
+            def _extract_set_directives_from_ast():
+                values = {}
+                try:
+                    tree = ast.parse(code)
+                except Exception:
+                    return values
+                for node in tree.body:
+                    if not isinstance(node, ast.Assign):
+                        continue
+                    if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                        continue
+                    key = node.targets[0].id
+                    if key not in {"MCP_SET_BUDGET_ENABLED", "MCP_SET_BUDGET_SECONDS", "MCP_SET_MAX_RENDERS"}:
+                        continue
+                    try:
+                        values[key] = ast.literal_eval(node.value)
+                    except Exception:
+                        pass
+                return values
+
+            scene = bpy.context.scene
+            use_budget = bool(getattr(scene, "blendermcp_exec_budget_enabled", True)) if scene else True
+            default_budget_seconds = float(getattr(scene, "blendermcp_exec_budget_seconds", 55.0)) if scene else 55.0
+            default_max_renders = int(getattr(scene, "blendermcp_exec_max_renders", 20)) if scene else 20
+
+            # Allow MCP-side runtime config via directives in execute_code body.
+            # Example:
+            #   # MCP_SET_BUDGET_ENABLED=true
+            #   # MCP_SET_BUDGET_SECONDS=45
+            #   # MCP_SET_MAX_RENDERS=18
+            if scene:
+                set_directives = _extract_set_directives_from_ast()
+                set_enabled = _parse_bool_directive(
+                    "MCP_SET_BUDGET_ENABLED",
+                    bool(getattr(scene, "blendermcp_exec_budget_enabled", True))
+                )
+                set_seconds = _parse_budget_directive(
+                    "MCP_SET_BUDGET_SECONDS",
+                    float(getattr(scene, "blendermcp_exec_budget_seconds", 55.0))
+                )
+                set_max_renders = int(_parse_budget_directive(
+                    "MCP_SET_MAX_RENDERS",
+                    float(getattr(scene, "blendermcp_exec_max_renders", 20))
+                ))
+
+                if "MCP_SET_BUDGET_ENABLED" in set_directives:
+                    set_enabled = bool(set_directives["MCP_SET_BUDGET_ENABLED"])
+                if "MCP_SET_BUDGET_SECONDS" in set_directives:
+                    try:
+                        set_seconds = float(set_directives["MCP_SET_BUDGET_SECONDS"])
+                    except Exception:
+                        pass
+                if "MCP_SET_MAX_RENDERS" in set_directives:
+                    try:
+                        set_max_renders = int(set_directives["MCP_SET_MAX_RENDERS"])
+                    except Exception:
+                        pass
+
+                scene.blendermcp_exec_budget_enabled = bool(set_enabled)
+                scene.blendermcp_exec_budget_seconds = max(5.0, min(115.0, float(set_seconds)))
+                scene.blendermcp_exec_max_renders = max(1, min(500, int(set_max_renders)))
+
+                use_budget = bool(scene.blendermcp_exec_budget_enabled)
+                default_budget_seconds = float(scene.blendermcp_exec_budget_seconds)
+                default_max_renders = int(scene.blendermcp_exec_max_renders)
+
+            budget_seconds = _parse_budget_directive("MCP_BUDGET_SECONDS", default_budget_seconds)
+            max_renders = int(_parse_budget_directive("MCP_MAX_RENDERS", float(default_max_renders)))
+            if not use_budget:
+                budget_seconds = 0.0
+                max_renders = 0
+
+            exec_state = {
+                "start": time.time(),
+                "render_calls": 0,
+                "render_time_sec": 0.0,
+            }
+
+            # Guardrail: avoid autokey side effects in UI/property assignment paths.
+            tool_settings = scene.tool_settings if scene else None
+            old_autokey = None
+            if tool_settings:
+                old_autokey = bool(tool_settings.use_keyframe_insert_auto)
+                tool_settings.use_keyframe_insert_auto = False
+
+            import sys as _sys
+
+            class _RenderModuleProxy:
+                def __init__(self, render_mod):
+                    self._render_mod = render_mod
+
+                def render(self, *args, **kwargs):
+                    now = time.time()
+                    elapsed = now - exec_state["start"]
+                    if budget_seconds > 0 and elapsed >= budget_seconds:
+                        raise _RenderBudgetExceeded(
+                            f"Execution budget exceeded before render call: elapsed={elapsed:.2f}s budget={budget_seconds:.2f}s"
+                        )
+                    if max_renders > 0 and exec_state["render_calls"] >= max_renders:
+                        raise _RenderBudgetExceeded(
+                            f"Render-call budget exceeded: render_calls={exec_state['render_calls']} max_renders={max_renders}"
+                        )
+
+                    t0 = time.time()
+                    result = self._render_mod.render(*args, **kwargs)
+                    dt = time.time() - t0
+                    exec_state["render_calls"] += 1
+                    exec_state["render_time_sec"] += dt
+                    print(
+                        f"MCP_PROGRESS render_calls={exec_state['render_calls']} "
+                        f"elapsed={time.time()-exec_state['start']:.2f}s render_dt={dt:.2f}s"
+                    )
+                    return result
+
+                def __getattr__(self, attr):
+                    return getattr(self._render_mod, attr)
+
+            class _OpsProxy:
+                def __init__(self, ops):
+                    self._ops = ops
+
+                def __getattr__(self, name):
+                    target = getattr(self._ops, name)
+                    if name == "render":
+                        return _RenderModuleProxy(target)
+                    return target
+
+            # Replace sys.modules['bpy'] during exec so `import bpy` also uses proxy.
+            real_bpy_mod = _sys.modules.get("bpy", bpy)
+            proxy_bpy_mod = types.ModuleType("bpy")
+            proxy_bpy_mod.ops = _OpsProxy(real_bpy_mod.ops)
+            proxy_bpy_mod.__dict__["__doc__"] = getattr(real_bpy_mod, "__doc__", "")
+
+            def _proxy_getattr(name):
+                return getattr(real_bpy_mod, name)
+
+            proxy_bpy_mod.__getattr__ = _proxy_getattr
+            _sys.modules["bpy"] = proxy_bpy_mod
+            namespace = {"bpy": proxy_bpy_mod}
+
+            def budget_trace(frame, event, arg):
+                if event == "line" and budget_seconds > 0:
+                    elapsed = time.time() - exec_state["start"]
+                    if elapsed >= budget_seconds:
+                        raise _RenderBudgetExceeded(
+                            f"Execution budget exceeded: elapsed={elapsed:.2f}s budget={budget_seconds:.2f}s"
+                        )
+                return budget_trace
 
             # Capture stdout during execution, and return it as result
             capture_buffer = io.StringIO()
-            with redirect_stdout(capture_buffer):
-                exec(code, namespace)
+            try:
+                with redirect_stdout(capture_buffer):
+                    if budget_seconds > 0:
+                        _sys.settrace(budget_trace)
+                    exec(code, namespace)
+            except _RenderBudgetExceeded as e:
+                captured_output = capture_buffer.getvalue()
+                elapsed = time.time() - exec_state["start"]
+                return {
+                    "executed": False,
+                    "interrupted": True,
+                    "reason": str(e),
+                    "elapsed_sec": elapsed,
+                    "budget_seconds": budget_seconds,
+                    "render_calls": exec_state["render_calls"],
+                    "max_renders": max_renders,
+                    "render_time_sec": exec_state["render_time_sec"],
+                    "result": captured_output,
+                }
+            finally:
+                try:
+                    _sys.settrace(None)
+                except Exception:
+                    pass
+                try:
+                    _sys.modules["bpy"] = real_bpy_mod
+                except Exception:
+                    pass
+                if tool_settings and old_autokey is not None:
+                    tool_settings.use_keyframe_insert_auto = old_autokey
 
             captured_output = capture_buffer.getvalue()
-            return {"executed": True, "result": captured_output}
-        except Exception as e:
+            elapsed = time.time() - exec_state["start"]
+            return {
+                "executed": True,
+                "interrupted": False,
+                "elapsed_sec": elapsed,
+                "budget_seconds": budget_seconds,
+                "render_calls": exec_state["render_calls"],
+                "max_renders": max_renders,
+                "render_time_sec": exec_state["render_time_sec"],
+                "result": captured_output,
+            }
+        except BaseException as e:
             raise Exception(f"Code execution error: {str(e)}")
 
 
@@ -2405,6 +2620,11 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         scene = context.scene
 
         layout.prop(scene, "blendermcp_port")
+        layout.prop(scene, "blendermcp_auto_start", text="Auto Start MCP")
+        layout.prop(scene, "blendermcp_exec_budget_enabled", text="Enable Execute Budget Guard")
+        if scene.blendermcp_exec_budget_enabled:
+            layout.prop(scene, "blendermcp_exec_budget_seconds", text="Budget Seconds")
+            layout.prop(scene, "blendermcp_exec_max_renders", text="Max Render Calls")
         layout.prop(scene, "blendermcp_use_polyhaven", text="Use assets from Poly Haven")
 
         layout.prop(scene, "blendermcp_use_hyper3d", text="Use Hyper3D Rodin 3D model generation")
@@ -2447,6 +2667,49 @@ class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
         self.report({'INFO'}, "API Key set successfully!")
         return {'FINISHED'}
 
+
+def _start_server_for_scene(scene):
+    """Start MCP server for the given scene if needed."""
+    if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
+        bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
+    bpy.types.blendermcp_server.start()
+
+
+def _should_auto_start(scene):
+    if not scene:
+        return False
+    auto_flag = bool(getattr(scene, "blendermcp_auto_start", False))
+    connected_flag = bool(getattr(scene, "blendermcp_server_running", False))
+    return auto_flag or connected_flag
+
+
+@persistent
+def blendermcp_load_post(_dummy):
+    """
+    Auto-start MCP server after opening a .blend.
+    """
+    try:
+        scene = bpy.context.scene
+        if _should_auto_start(scene):
+            _start_server_for_scene(scene)
+            scene.blendermcp_server_running = True
+            print(f"BlenderMCP auto-started on file load (port {scene.blendermcp_port})")
+    except Exception as e:
+        print(f"BlenderMCP load_post auto-start failed: {e}")
+
+
+def blendermcp_register_autostart_once():
+    """One-shot autostart check after addon registration."""
+    try:
+        scene = bpy.context.scene
+        if _should_auto_start(scene):
+            _start_server_for_scene(scene)
+            scene.blendermcp_server_running = True
+            print(f"BlenderMCP auto-started after register (port {scene.blendermcp_port})")
+    except Exception as e:
+        print(f"BlenderMCP post-register auto-start failed: {e}")
+    return None
+
 # Operator to start the server
 class BLENDERMCP_OT_StartServer(bpy.types.Operator):
     bl_idname = "blendermcp.start_server"
@@ -2456,12 +2719,8 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
 
-        # Create a new server instance
-        if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
-            bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
-
-        # Start the server
-        bpy.types.blendermcp_server.start()
+        # Start/reuse server instance
+        _start_server_for_scene(scene)
         server = bpy.types.blendermcp_server
         if server.running and server.socket:
             scene.blendermcp_port = server.port
@@ -2522,6 +2781,30 @@ def register():
     bpy.types.Scene.blendermcp_server_running = bpy.props.BoolProperty(
         name="Server Running",
         default=False
+    )
+    bpy.types.Scene.blendermcp_auto_start = bpy.props.BoolProperty(
+        name="Auto Start MCP",
+        description="Automatically start MCP server after file load and addon registration",
+        default=True
+    )
+    bpy.types.Scene.blendermcp_exec_budget_enabled = bpy.props.BoolProperty(
+        name="Enable Execute Budget Guard",
+        description="Interrupt long execute_code calls before 120s timeout",
+        default=True
+    )
+    bpy.types.Scene.blendermcp_exec_budget_seconds = FloatProperty(
+        name="Budget Seconds",
+        description="Soft time budget for a single execute_code call",
+        default=55.0,
+        min=5.0,
+        max=115.0
+    )
+    bpy.types.Scene.blendermcp_exec_max_renders = IntProperty(
+        name="Max Render Calls",
+        description="Maximum bpy.ops.render.render calls in one execute_code call",
+        default=20,
+        min=1,
+        max=500
     )
 
     bpy.types.Scene.blendermcp_use_polyhaven = bpy.props.BoolProperty(
@@ -2639,6 +2922,9 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
     bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
+    if blendermcp_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(blendermcp_load_post)
+    bpy.app.timers.register(blendermcp_register_autostart_once, first_interval=0.2)
 
     print("BlenderMCP addon registered")
 
@@ -2654,9 +2940,15 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_OpenTerms)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
+    if blendermcp_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(blendermcp_load_post)
 
     del bpy.types.Scene.blendermcp_port
     del bpy.types.Scene.blendermcp_server_running
+    del bpy.types.Scene.blendermcp_auto_start
+    del bpy.types.Scene.blendermcp_exec_budget_enabled
+    del bpy.types.Scene.blendermcp_exec_budget_seconds
+    del bpy.types.Scene.blendermcp_exec_max_renders
     del bpy.types.Scene.blendermcp_use_polyhaven
     del bpy.types.Scene.blendermcp_use_hyper3d
     del bpy.types.Scene.blendermcp_hyper3d_mode
