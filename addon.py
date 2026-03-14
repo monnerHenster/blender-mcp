@@ -416,19 +416,82 @@ class BlenderMCPServer:
             if not filepath:
                 return {"error": "No filepath provided"}
 
-            # Find the active 3D viewport
+            # Find a valid VIEW_3D area with a WINDOW region.
+            window = None
+            screen = None
             area = None
-            for a in bpy.context.screen.areas:
-                if a.type == 'VIEW_3D':
-                    area = a
+            region = None
+            for w in bpy.context.window_manager.windows:
+                scr = w.screen
+                for a in scr.areas:
+                    if a.type != 'VIEW_3D':
+                        continue
+                    win_region = next((r for r in a.regions if r.type == 'WINDOW'), None)
+                    if win_region:
+                        window = w
+                        screen = scr
+                        area = a
+                        region = win_region
+                        break
+                if area:
                     break
 
-            if not area:
+            if not area or not region:
                 return {"error": "No 3D viewport found"}
 
-            # Take screenshot with proper context override
-            with bpy.context.temp_override(area=area):
+            # Take screenshot with a full context override to avoid black captures.
+            with bpy.context.temp_override(window=window, screen=screen, area=area, region=region):
+                # Ensure viewport is refreshed before reading pixels.
+                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
                 bpy.ops.screen.screenshot_area(filepath=filepath)
+
+            def _is_near_black(image):
+                # Sample pixels to avoid iterating the full buffer for large screenshots.
+                px = image.pixels
+                n = len(px)
+                if n < 4:
+                    return True
+                step = max(4, (n // 8192))
+                step = step - (step % 4) if step % 4 else step
+                if step <= 0:
+                    step = 4
+                total = 0.0
+                max_luma = 0.0
+                count = 0
+                for i in range(0, n - 3, step):
+                    r = px[i]
+                    g = px[i + 1]
+                    b = px[i + 2]
+                    luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                    total += luma
+                    if luma > max_luma:
+                        max_luma = luma
+                    count += 1
+                if count == 0:
+                    return True
+                avg_luma = total / count
+                return avg_luma < 0.01 and max_luma < 0.03
+
+            # Some GPU/OS states produce an all-black screenshot_area image.
+            # Fall back to OpenGL viewport render in that case.
+            initial_img = bpy.data.images.load(filepath)
+            width0, height0 = initial_img.size
+            black_capture = _is_near_black(initial_img)
+            tiny_capture = width0 <= 4 or height0 <= 4
+            bpy.data.images.remove(initial_img)
+            if black_capture or tiny_capture:
+                scene = bpy.context.scene
+                old_path = scene.render.filepath
+                old_fmt = scene.render.image_settings.file_format
+                try:
+                    scene.render.filepath = filepath
+                    scene.render.image_settings.file_format = format.upper()
+                    with bpy.context.temp_override(window=window, screen=screen, area=area, region=region):
+                        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+                        bpy.ops.render.opengl(write_still=True, view_context=True)
+                finally:
+                    scene.render.filepath = old_path
+                    scene.render.image_settings.file_format = old_fmt
 
             # Load and resize if needed
             img = bpy.data.images.load(filepath)
